@@ -1,0 +1,6 @@
+-r requirements.txt
+# Install a matching torch/torchvision build for your CUDA or CPU runtime.
+torch>=2.6
+torchvision>=0.21
+Pillow>=10
+tensorboard>=2.18,<3

@@ -2,7 +2,6 @@ import torch
 import os as _os
 from transformers import AutoTokenizer
 from transformers import T5ForConditionalGeneration, T5Config
-from custom_datasets import HFDataCollector
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat
 from torch.nn import MSELoss, CTCLoss, CrossEntropyLoss
@@ -62,11 +61,17 @@ SPECIAL_TOKEN_COUNT = 3
 class Emuru(torch.nn.Module):
     def __init__(self, t5_checkpoint='google-t5/t5-base',
                  vae_checkpoint='blowing-up-groundhogs/emuru_vae',
-                 ocr_checkpoint='files/checkpoints/Origami_bw_img/origami.pth', slices_per_query=1, channels=1, text_dropout_probability=0.0, img_dropout_probability=0.0):
+                 ocr_checkpoint='files/checkpoints/Origami_bw_img/origami.pth', slices_per_query=1, channels=1, text_dropout_probability=0.0, img_dropout_probability=0.0, image_height=64, latent_head='linear', diffusion_width=256, diffusion_depth=3,
+                 diffusion_steps=20, diffusion_latent_scale=1.0):
         super(Emuru, self).__init__()
+        if image_height <= 0 or image_height % 8 or slices_per_query != 1:
+            raise ValueError("image_height must be a positive multiple of 8; slices_per_query must be 1")
+        self.image_height = image_height
+        self.teacher_noise = 0.0
+        self.target_noise_probability = 0.0
+        self.target_noise_std_ratio = 0.05
         self.tokenizer = AutoTokenizer.from_pretrained('google/byt5-small')  # per-character tokenizer
         self.tokenizer.add_tokens(["<sog>"])
-        self.data_collator = HFDataCollector(tokenizer=self.tokenizer)
         self.t5_name_or_path = t5_checkpoint
 
         self.padding_token = torch.tensor([[-0.4951,  0.8021,  0.3429,  0.5622,  0.5271,  0.5756,  0.7194,  0.6150]])
@@ -92,10 +97,26 @@ class Emuru(torch.nn.Module):
         
         self.vae = AutoencoderKL.from_pretrained(vae_checkpoint)
         
-        vae_latent_dim = 8 # self.vae.config.get('latent_channels', 8)
+        channels = self.vae.config.latent_channels
+        vae_latent_dim = image_height // 8
+        self.latent_channels = channels
 
         self.query_emb = torch.nn.Linear(vae_latent_dim * channels * slices_per_query, config.d_model)
         self.t5_to_vae = torch.nn.Linear(config.d_model, vae_latent_dim * channels * slices_per_query)
+        if latent_head not in ('linear', 'diffusion'):
+            raise ValueError('latent_head must be linear or diffusion')
+        if diffusion_steps < 1:
+            raise ValueError('diffusion_steps must be positive')
+        self.latent_head = latent_head
+        self.diffusion_steps = diffusion_steps
+        self.head_config = dict(latent_head=latent_head, diffusion_width=diffusion_width,
+            diffusion_depth=diffusion_depth, diffusion_steps=diffusion_steps,
+            diffusion_latent_scale=diffusion_latent_scale)
+        if latent_head == 'diffusion':
+            from models.diffusion_head import DiffusionHead
+            self.diffusion_head = DiffusionHead(config.d_model, vae_latent_dim * channels * slices_per_query,
+                                               diffusion_width, diffusion_depth, diffusion_latent_scale)
+            self.t5_to_vae.requires_grad_(False)
         self.t5_to_special = torch.nn.Linear(config.d_model, SPECIAL_TOKEN_COUNT)
         self.t5_to_ocr = torch.nn.Linear(config.d_model, len(self.tokenizer), bias=False)
 
@@ -106,8 +127,10 @@ class Emuru(torch.nn.Module):
 
         self.set_training(self.vae, False)
 
-        self.ocr = OrigamiNet.from_checkpoint(ocr_checkpoint, o_classes=165, n_channels=1)
-        self.set_training(self.ocr, False)
+        self.ocr = None
+        if ocr_checkpoint is not None:
+            self.ocr = OrigamiNet.from_checkpoint(ocr_checkpoint, o_classes=165, n_channels=1)
+            self.set_training(self.ocr, False)
         
         self.query_rearrange = Rearrange('b c h (w q) -> b w (q c h)', q=slices_per_query)
         self.special_rearrange = torch.nn.Identity()
@@ -123,6 +146,18 @@ class Emuru(torch.nn.Module):
         # Minimal attributes for TRL compatibility
         self.warnings_issued = {}
         self._model_tags = set()
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.vae.eval()
+        if getattr(self, 'freeze_decoder', False):
+            self.T5.decoder.eval()
+        elif getattr(self, 'freeze_decoder_ffn', False):
+            for block in self.T5.decoder.block:
+                block.layer[2].eval()
+        if self.ocr is not None:
+            self.ocr.eval()
+        return self
 
     def add_model_tags(self, tags):
         try:
@@ -156,86 +191,99 @@ class Emuru(torch.nn.Module):
         return self.vae.encode(img.float()).latent_dist.sample()
 
     @torch.no_grad()
-    def get_model_inputs(self, style_img, gen_img, style_len, gen_len, max_img_len):
-        bs = len(style_img)
-        decoder_inputs_embeds_list = []
-        specials_list = []
-        
-        # Move images to device and pad them
-        style_img = pad_images([el.to(self.T5.device) for el in style_img])
-        
-        if gen_img is not None:
-            gen_img = pad_images([el.to(self.T5.device) for el in gen_img])
-            gen_img_embeds = self._img_encode(gen_img)
+    def _encode_unpadded(self, images, lengths):
+        """Encode true image extents before latent batching.
+
+        VAE GroupNorm statistics depend on the spatial canvas. Encoding a short
+        line on its neighbour's wider white canvas changes the training target.
+        Equal-width images can share a VAE call; different widths cannot.
+        """
+        count = len(images)
+        if isinstance(lengths, torch.Tensor):
+            lengths = lengths.detach().cpu().reshape(-1).tolist()
+        elif isinstance(lengths, int):
+            lengths = [lengths] * count
         else:
-            gen_img_embeds = None
+            lengths = list(lengths)
+        if len(lengths) == 1 and count > 1:
+            lengths *= count
+        if len(lengths) != count:
+            raise ValueError('Image count and width count differ')
+        groups = {}
+        for index, (image, length) in enumerate(zip(images, lengths)):
+            length = int(length)
+            if length <= 0 or length > image.shape[-1]:
+                raise ValueError('Image width lies outside its supplied canvas')
+            width = (length + 7) // 8 * 8
+            cropped = image[..., :length].to(self.T5.device)
+            if width != length:
+                cropped = torch.nn.functional.pad(cropped, (0, width-length), value=1)
+            groups.setdefault(width, []).append((index, cropped))
+        encoded = [None] * count
+        for group in groups.values():
+            latents = self._img_encode(torch.stack([image for _, image in group]))
+            for (index, _), latent in zip(group, latents):
+                encoded[index] = latent
+        return encoded
 
-        style_img_embeds = self._img_encode(style_img)
-        
-        for el in range(bs):
-            if isinstance(style_len, int):
-                sl = style_len
-            else:
-                # Safely get scalar style length
-                sl_tensor = style_len[el] if hasattr(style_len, '__getitem__') else style_len
-                sl = _safe_int_from_maybe_tensor(sl_tensor)
+    @torch.no_grad()
+    def get_model_inputs(self, style_img, gen_img, style_len, gen_len, max_img_len):
+        styles = self._encode_unpadded(style_img, style_len)
+        targets = self._encode_unpadded(gen_img, gen_len) if gen_img is not None and gen_len is not None else None
+        if targets is not None and len(targets) != len(styles):
+            raise ValueError('Style and target image counts differ')
+        sequences, labels = [], []
+        for index, style in enumerate(styles):
+            parts = [style]
+            specials = [torch.full((style.shape[-1],), 2, device=style.device)]
+            if targets is not None:
+                target = targets[index]
+                parts.extend([torch.ones_like(style[..., :1]), target,
+                              torch.ones_like(style[..., :1])])
+                specials.extend([torch.zeros(1, device=style.device),
+                                 torch.full((target.shape[-1],), 2, device=style.device),
+                                 torch.ones(1, device=style.device)])
+            sequences.append(rearrange(torch.cat(parts, dim=-1), 'c h w -> w (c h)'))
+            labels.append(torch.cat(specials).long())
+        decoder_inputs = pad_sequence(sequences, padding_value=1, batch_first=True)
+        # Eruku section5 explicitly supervises repeated EOG after the real end.
+        # Latent MSE still excludes these positions because they are not IMG.
+        specials = pad_sequence(labels, padding_value=1, batch_first=True)
+        if decoder_inputs.size(1) > max_img_len // 8:
+            raise ValueError('Style + target + SOG/EOG exceed max_img_len; refusing to truncate text or EOG')
+        return {'decoder_inputs_embeds': decoder_inputs, 'specials': specials}
 
-            # Ensure widths are within bounds. sl is a pixel-space length
-            # (it's used below as sl//8 to index into the latent-space
-            # embeds), so it must be compared against a pixel-space bound --
-            # style_img_embeds.shape[-1] is already latent-space, so it needs
-            # the *8 to convert back. Without it, sl gets clamped to at most
-            # ~1/8th of the intended style context.
-            sl = max(64, min(sl, style_img_embeds.shape[-1] * 8))
-            
-            # Start with style image embeds
-            sample_embeds_parts = [style_img_embeds[el,:,:,:sl//8]]
-            specials_parts = [torch.ones(sl//8) * 2] # Img token
+    def _teacher_forcing_inputs(self, clean_latents, specials):
+        """Perturb decoder inputs only; prediction targets always remain clean.
 
-            if gen_img_embeds is not None and gen_len is not None:
-                if isinstance(gen_len, int):
-                    gl = gen_len
-                else:
-                    gl_tensor = gen_len[el] if hasattr(gen_len, '__getitem__') else gen_len
-                    gl = _safe_int_from_maybe_tensor(gl_tensor)
-
-                gl = max(64, min(gl, gen_img_embeds.shape[-1] * 8))  # same pixel/latent unit fix as sl above
-                sample_embeds_parts.extend([
-                    torch.ones(1, 8, 1).to(self.T5.device), # SOG token placeholder
-                    gen_img_embeds[el,:,:,:gl//8],
-                    torch.ones(1, 8, 1).to(self.T5.device), # EOG token placeholder
-                ])
-                specials_parts.extend([
-                    torch.zeros(1), # SOG
-                    torch.ones(gl//8) * 2, # Img
-                    torch.ones(1), # EOG
-                ])
-
-            sample_embeds = torch.cat(sample_embeds_parts, dim=-1)
-
-            h_dim = sample_embeds.shape[1]
-            sample_embeds = rearrange(sample_embeds, 'c h w -> w (h c)', h=h_dim, c=1)
-
-            decoder_inputs_embeds_list.append(sample_embeds)
-
-            sample_specials = torch.cat(specials_parts, dim=0).to(self.T5.device)
-            specials_list.append(sample_specials)
-
-        # Pad sequences and ensure consistent shapes
-        decoder_inputs_embeds_padded = pad_sequence(decoder_inputs_embeds_list, padding_value=1, batch_first=True)
-        specials_padded = pad_sequence(specials_list, padding_value=1, batch_first=True)
-        
-        # Ensure we don't exceed max_img_len
-        max_seq_len = max_img_len // 8
-        if decoder_inputs_embeds_padded.size(1) > max_seq_len:
-            decoder_inputs_embeds_padded = decoder_inputs_embeds_padded[:, :max_seq_len]
-        if specials_padded.size(1) > max_seq_len:
-            specials_padded = specials_padded[:, :max_seq_len]
-        
-        return {
-            'decoder_inputs_embeds': decoder_inputs_embeds_padded,
-            'specials': specials_padded.long(),
-        }
+        Target-noise magnitude is relative to each sequence's valid target
+        latent std, measured in fp32 with population variance. Style, markers,
+        and padding contribute neither noise nor scale statistics.
+        """
+        if not self.training:
+            return clean_latents
+        if self.target_noise_probability > 0:
+            if self.target_noise_std_ratio == 0:
+                return clean_latents
+            target = ((specials == 2) & ((specials == 0).cumsum(1) > 0)
+                      & ((specials == 1).cumsum(1) == 0)).unsqueeze(-1)
+            if not target.any():
+                return clean_latents
+            with torch.no_grad():
+                values = clean_latents.detach().float()
+                count = (target.sum(dim=(1, 2), keepdim=True) * values.shape[-1]).clamp_min(1)
+                mean = (values * target).sum(dim=(1, 2), keepdim=True) / count
+                variance = ((values - mean).square() * target).sum(dim=(1, 2), keepdim=True) / count
+                scale = variance.clamp_min(0).sqrt() * self.target_noise_std_ratio
+                selected = torch.rand(values.shape[0], 1, 1, device=values.device) < self.target_noise_probability
+                noise = torch.randn_like(values) * scale * target * selected
+            return clean_latents + noise.to(clean_latents.dtype)
+        # Preserve the existing Emuru-inspired unit-noise option when the new
+        # target-only mode is disabled. Never apply both noise modes together.
+        if self.teacher_noise > 0:
+            selected = torch.rand(clean_latents.shape[0], 1, 1, device=clean_latents.device) < self.teacher_noise
+            return clean_latents + torch.randn_like(clean_latents) * selected
+        return clean_latents
 
     def forward(self, decoder_inputs_embeds_vae, specials, style_text, gen_text, ce_multiplier=1.0):
         # style_img_embeds: [bs, w//8, 8, 1]
@@ -249,7 +297,8 @@ class Emuru(torch.nn.Module):
         sog = repeat(self.sog.weight, '1 d -> b d', b=decoder_inputs_embeds_vae.size(0))
         # eog = repeat(self.eog.weight, '1 d -> b d', b=decoder_inputs_embeds_vae.size(0))
 
-        decoder_inputs_embeds = self.query_emb(decoder_inputs_embeds_vae)
+        noisy_latents = self._teacher_forcing_inputs(decoder_inputs_embeds_vae, specials)
+        decoder_inputs_embeds = self.query_emb(noisy_latents)
         
         # Fix the indexing assignment to avoid shape mismatch
         sog_mask = (specials == 0)
@@ -259,30 +308,39 @@ class Emuru(torch.nn.Module):
         sog_expanded = sog.unsqueeze(1).expand(-1, decoder_inputs_embeds.size(1), -1)
         
         if sog_mask.any():
-            decoder_inputs_embeds[sog_mask] = sog_expanded[sog_mask]
+            decoder_inputs_embeds[sog_mask] = sog_expanded[sog_mask].to(decoder_inputs_embeds.dtype)
         
         if eog_mask.any():
             # Expand eog to match the sequence dimension
             eog_expanded = self.eog.weight.unsqueeze(0).expand(decoder_inputs_embeds.size(0), decoder_inputs_embeds.size(1), -1)
-            decoder_inputs_embeds[eog_mask] = eog_expanded[eog_mask]
+            decoder_inputs_embeds[eog_mask] = eog_expanded[eog_mask].to(decoder_inputs_embeds.dtype)
 
         decoder_inputs_embeds = torch.cat(
             [
-                sos,
+                sos.to(decoder_inputs_embeds.dtype),
                 decoder_inputs_embeds
             ], dim = 1,
         )
 
         inputs_embeds = self.T5.shared(encoded_text['input_ids'].to(self.T5.device))
         drop_ids = torch.rand(inputs_embeds.shape[0], device=inputs_embeds.device) < self.dropout_probability
-        if self.drop_text:
+        if self.drop_text and self.training:
             inputs_embeds = torch.where(drop_ids[:, None, None], self.uncond_embedding.weight, inputs_embeds)
-        if self.drop_img:
+        if self.drop_img and self.training:
             decoder_inputs_embeds = torch.where(drop_ids[:, None, None], self.uncond_embedding.weight, decoder_inputs_embeds)
         
-        output = self.T5(inputs_embeds=inputs_embeds, attention_mask=encoded_text['attention_mask'].to(self.T5.device), decoder_inputs_embeds=decoder_inputs_embeds)
+        output = self.T5(inputs_embeds=inputs_embeds, attention_mask=encoded_text['attention_mask'].to(self.T5.device), decoder_inputs_embeds=decoder_inputs_embeds, use_cache=False)
         
-        vae_latent = self.t5_to_vae(output.logits[:, :-1])
+        hidden = output.logits[:, :-1]
+        diffusion_loss = hidden.new_zeros((), dtype=torch.float32)
+        if self.latent_head == 'diffusion':
+            image_mask = specials == 2
+            diffusion_loss, estimates = self.diffusion_head.training_loss(
+                decoder_inputs_embeds_vae[image_mask], hidden[image_mask])
+            vae_latent = estimates.new_zeros(decoder_inputs_embeds_vae.shape)
+            vae_latent[image_mask] = estimates
+        else:
+            vae_latent = self.t5_to_vae(hidden)
         special_latent = self.t5_to_special(output.logits[:, :-1]) # [bs, w//8, 3]
         pred_latent = self.z_rearrange(vae_latent)
         special_pred = self.special_rearrange(special_latent)
@@ -293,19 +351,45 @@ class Emuru(torch.nn.Module):
         mse_mask = (specials == 2).unsqueeze(2) # [bs, w//8] TODO:consider putting the mask back in
         gt = decoder_inputs_embeds_vae * mse_mask
         vae_latent = vae_latent * mse_mask
-        mse_loss = self.mse_criterion(vae_latent, gt)#/mse_mask.sum()
+        mse_loss = ((vae_latent - gt).square().sum() /
+                    (mse_mask.sum().clamp_min(1) * gt.shape[-1]))
         ocr_loss = 0
 
         if self.alpha < 1.0:
             pred_img = self.vae.decode(pred_latent).sample
-            gt_img = self.vae.decode(decoder_inputs_embeds_vae.unsqueeze(1)).sample
+            gt_img = self.vae.decode(self.z_rearrange(decoder_inputs_embeds_vae)).sample
             ocr_preds = self.ocr(pred_img)
             ocr_gt = self.ocr(gt_img)
             ocr_loss = self.mse_criterion(ocr_preds, ocr_gt)
         else:
             ocr_loss = torch.tensor(0.0).to(mse_loss.device)
-        loss = (ce_loss + mse_loss) * self.alpha + ocr_loss * (1 - self.alpha)
-        return {'loss': loss, 'mse_loss': mse_loss, 'ce_loss': ce_loss, 'ocr_loss': ocr_loss}, pred_latent
+        latent_loss = diffusion_loss if self.latent_head == 'diffusion' else mse_loss
+        loss = (ce_loss + latent_loss) * self.alpha + ocr_loss * (1 - self.alpha)
+        # Rare boundaries can fail while the mean image-token CE looks excellent.
+        # Report them separately, without changing the optimized objective.
+        with torch.no_grad():
+            predictions = special_pred.detach().argmax(-1)
+            sog_positions = specials == 0
+            # Count only the first EOG as a boundary, not its training padding.
+            all_eog = specials == 1
+            eog_positions = all_eog & (all_eog.cumsum(dim=1) == 1)
+            sog_accuracy = ((predictions == 0) & sog_positions).sum() / sog_positions.sum().clamp_min(1)
+            eog_accuracy = ((predictions == 1) & eog_positions).sum() / eog_positions.sum().clamp_min(1)
+            boundary_positions = sog_positions | eog_positions
+            token_ce = torch.nn.functional.cross_entropy(
+                special_pred.detach().flatten(0, 1), specials.flatten(0, 1),
+                reduction='none', ignore_index=-100).view_as(specials)
+            boundary_ce_loss = (token_ce * boundary_positions).sum() / boundary_positions.sum().clamp_min(1)
+        return {'loss': loss, 'diffusion_loss': diffusion_loss, 'mse_loss': mse_loss, 'ce_loss': ce_loss, 'ocr_loss': ocr_loss,
+                'boundary_ce_loss': boundary_ce_loss, 'sog_accuracy': sog_accuracy,
+                'eog_accuracy': eog_accuracy}, pred_latent
+
+    def predict_next_latent(self, context, unconditional=None, cfg_scale=1.0):
+        if self.latent_head == 'diffusion':
+            return self.diffusion_head.sample(context, self.diffusion_steps, unconditional, cfg_scale)
+        if unconditional is not None:
+            context = unconditional + cfg_scale * (context - unconditional)
+        return self.t5_to_vae(context)
 
     def split_characters(self, pred, gt, indices):
         pred = self.vae.decode(pred).sample
@@ -378,11 +462,12 @@ class Emuru(torch.nn.Module):
                 decoder_inputs_embeds = torch.cat([sos, decoder_inputs_embeds], dim=1)
             else:
                 decoder_inputs_embeds = torch.cat([sos, decoder_inputs_embeds, sog], dim=1)
-                vae_latent = self.t5_to_vae(sog)
+                vae_latent = self.predict_next_latent(sog)
                 special_sequence = torch.cat([special_sequence, torch.zeros(1)])
                 z_sequence.append(vae_latent)
 
         for i in range(max_new_tokens):
+            output_unconditional = None
             if cfg_scale != 1.0:
                 conditional_text_embeds = self.T5.shared(text_input_ids)
                 if self.drop_text:
@@ -400,20 +485,21 @@ class Emuru(torch.nn.Module):
                 output = output_unconditional + (output_conditional - output_unconditional) * cfg_scale
             else:
                 output = self.T5(input_ids=text_input_ids, attention_mask=text_mask, decoder_inputs_embeds=decoder_inputs_embeds).logits[:, -1:]
+                output_conditional = output
 
             special_prediction = self.t5_to_special(output)
 
             if torch.argmax(special_prediction, dim=-1) == 0:
                 decoder_inputs_embeds = torch.cat([decoder_inputs_embeds, sog], dim=1)
-                vae_latent = self.t5_to_vae(output)
+                vae_latent = self.predict_next_latent(output)
                 special_sequence = torch.cat([special_sequence, torch.zeros(1)])
             elif torch.argmax(special_prediction, dim=-1) == 1:
                 special_sequence = torch.cat([special_sequence, torch.ones(1)])
-                vae_latent = self.t5_to_vae(output)
+                vae_latent = self.predict_next_latent(output)
                 z_sequence.append(vae_latent)
                 break
             else:
-                vae_latent = self.t5_to_vae(output)
+                vae_latent = self.predict_next_latent(output_conditional, output_unconditional, cfg_scale)
                 decoder_inputs_embeds = torch.cat([decoder_inputs_embeds, self.query_emb(vae_latent)], dim=1)
                 special_sequence = torch.cat([special_sequence, torch.ones(1)*2])
             z_sequence.append(vae_latent)
